@@ -68,7 +68,6 @@ Create a JSON file in the `data/queue/` directory:
 {
   "id": "unique-job-id",
   "text": "Hello from x-poster!",
-  "image_paths": ["path/to/image.jpg"],
   "publish_at": "2025-01-28T12:00:00Z",
   "labels": ["greeting"]
 }
@@ -80,9 +79,21 @@ Create a JSON file in the `data/queue/` directory:
 |-------|------|----------|-------------|
 | `id` | string | Yes | Unique identifier for the job |
 | `text` | string | No | Tweet text (max 280 characters) |
-| `image_paths` | array | No | 1-4 image paths (relative to base-dir or absolute) |
 | `publish_at` | string | No | ISO 8601 datetime; if set, post is delayed until this time |
 | `labels` | array | No | Tags for organization |
+
+### Images
+
+Images are auto-discovered from a folder matching the job `id`. Place images in `data/queue/img/<job-id>/`:
+
+```
+data/queue/img/unique-job-id/
+├── image1.jpg
+├── image2.png
+└── image3.webp
+```
+
+If no matching folder exists, the post will be published without images.
 
 ### Posting
 
@@ -153,10 +164,11 @@ data/
    ```json
    {
      "id": "my-first-post",
-     "text": "Testing x-poster!",
-     "image_paths": ["./photos/screenshot.png"]
+     "text": "Testing x-poster!"
    }
    ```
+
+   Optionally, add images in `data/queue/img/my-first-post/`.
 
 3. Validate and post:
    ```bash
