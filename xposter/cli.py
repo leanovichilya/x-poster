@@ -20,6 +20,7 @@ from .queue import (
 )
 from .twitter import XApiError, XClient
 from .utils import now_utc, resolve_data_dir
+from .watcher import run_watch
 
 
 app = typer.Typer(help="xposter CLI")
@@ -198,6 +199,19 @@ def validate(
             typer.echo(f"- {err}")
         raise typer.Exit(code=1)
     typer.echo("Validation OK.")
+
+
+@app.command()
+def watch(
+    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory (default: ./data or XP_DATA_DIR)."),
+    base_dir: Path = typer.Option(
+        None, "--base-dir", help="Base directory for relative image paths (default: current working dir)."
+    ),
+) -> None:
+    """Watch queue for new jobs and process scheduled posts."""
+    data_dir = resolve_data_dir(data_dir)
+    base_dir = base_dir or Path.cwd()
+    run_watch(data_dir, base_dir)
 
 
 if __name__ == "__main__":

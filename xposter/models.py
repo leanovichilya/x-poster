@@ -17,8 +17,8 @@ MAX_IMAGES = 4
 class PostJob(BaseModel):
     id: str
     publish_at: datetime | None = None
-    text: str = Field(min_length=1)
-    image_paths: list[Path]
+    text: str = ""
+    image_paths: list[Path] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
 
     @field_validator("publish_at", mode="before")
@@ -41,6 +41,11 @@ class PostJob(BaseModel):
     @classmethod
     def _validate_images(cls, value: list[Path]) -> list[Path]:
         count = len(value)
-        if count < MIN_IMAGES or count > MAX_IMAGES:
-            raise ValueError(f"image_paths must contain {MIN_IMAGES}-{MAX_IMAGES} items")
+        if count > MAX_IMAGES:
+            raise ValueError(f"image_paths must contain at most {MAX_IMAGES} items")
         return value
+
+    def validate_image_count(self) -> None:
+        count = len(self.image_paths)
+        if count < MIN_IMAGES or count > MAX_IMAGES:
+            raise ValueError(f"image_paths must contain {MIN_IMAGES}-{MAX_IMAGES} items, got {count}")

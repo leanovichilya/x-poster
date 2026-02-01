@@ -4,6 +4,8 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+data/
+data/tokens.json
 
 __pycache__/
 *.py[cod]

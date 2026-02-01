@@ -16,7 +16,21 @@ from .utils import FileCheck, now_utc, read_json, write_json
 mimetypes.add_type("image/webp", ".webp")
 
 ALLOWED_MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def discover_images(job_file: Path, img_dir: Path) -> list[Path]:
+    """Find images in img/{job_name}/ folder for a job file."""
+    job_name = job_file.stem
+    job_img_dir = img_dir / job_name
+    if not job_img_dir.is_dir():
+        return []
+    images = [
+        p for p in sorted(job_img_dir.iterdir())
+        if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
+    ]
+    return images
 
 
 @dataclass(frozen=True)
@@ -28,7 +42,7 @@ class JobFile:
 
 def init_storage(data_dir: Path) -> None:
     paths = data_paths(data_dir)
-    for key in ("queue", "sent", "failed"):
+    for key in ("queue", "img", "sent", "failed"):
         paths[key].mkdir(parents=True, exist_ok=True)
     if not paths["tokens"].exists():
         write_json(paths["tokens"], {})
@@ -45,10 +59,16 @@ def list_queue_files(queue_dir: Path) -> list[Path]:
 
 def scan_queue(queue_dir: Path) -> list[JobFile]:
     jobs: list[JobFile] = []
+    img_dir = queue_dir / "img"
     for path in list_queue_files(queue_dir):
         try:
             payload = read_json(path)
             job = PostJob.model_validate(payload)
+            # Auto-discover images if none specified
+            if not job.image_paths:
+                discovered = discover_images(path, img_dir)
+                job = job.model_copy(update={"image_paths": discovered})
+            job.validate_image_count()
             jobs.append(JobFile(path=path, job=job, error=None))
         except Exception as exc:  # noqa: BLE001 - we want to capture parsing errors
             jobs.append(JobFile(path=path, job=None, error=str(exc)))

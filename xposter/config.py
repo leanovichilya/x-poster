@@ -47,8 +47,10 @@ def data_paths(data_dir: Path) -> dict[str, Path]:
     return {
         "data": data_dir,
         "queue": data_dir / "queue",
+        "img": data_dir / "queue" / "img",
         "sent": data_dir / "sent",
         "failed": data_dir / "failed",
         "tokens": data_dir / "tokens.json",
+        "schedule": data_dir / "schedule.json",
         "log": data_dir / "log.jsonl",
     }

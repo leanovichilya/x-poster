@@ -52,9 +52,13 @@ class XClient:
 
     def create_tweet(self, text: str, media_ids: list[str]) -> dict[str, Any]:
         url = f"{self.base_url}/2/tweets"
-        payload: dict[str, Any] = {"text": text}
+        payload: dict[str, Any] = {}
+        if text.strip():
+            payload["text"] = text
         if media_ids:
             payload["media"] = {"media_ids": media_ids}
+        if not payload:
+            raise XApiError("Tweet must include text or media")
         with httpx.Client(timeout=30) as client:
             response = client.post(url, headers=self._headers(), json=payload)
         return self._handle_response(response)

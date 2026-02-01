@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+import re
 
 
 def now_utc() -> datetime:
@@ -15,6 +16,44 @@ def parse_iso_datetime(value: str) -> datetime:
     if not value:
         raise ValueError("publish_at is empty")
     value = value.strip()
+    local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+    match = re.match(r"^(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})$", value)
+    if match:
+        parts = {key: int(val) for key, val in match.groupdict().items()}
+        return datetime(parts["year"], parts["month"], parts["day"], tzinfo=local_tz)
+    match = re.match(r"^(?P<hour>\d{2}):(?P<minute>\d{2})$", value)
+    if match:
+        parts = {key: int(val) for key, val in match.groupdict().items()}
+        now = datetime.now().astimezone()
+        return datetime(now.year, now.month, now.day, parts["hour"], parts["minute"], tzinfo=now.tzinfo)
+    match = re.match(
+        r"^(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})[ T](?P<hour>\d{2}):(?P<minute>\d{2})$",
+        value,
+    )
+    if match:
+        parts = {key: int(val) for key, val in match.groupdict().items()}
+        return datetime(
+            parts["year"],
+            parts["month"],
+            parts["day"],
+            parts["hour"],
+            parts["minute"],
+            tzinfo=local_tz,
+        )
+    match = re.match(
+        r"^(?P<hour>\d{2}):(?P<minute>\d{2})[ T](?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})$",
+        value,
+    )
+    if match:
+        parts = {key: int(val) for key, val in match.groupdict().items()}
+        return datetime(
+            parts["year"],
+            parts["month"],
+            parts["day"],
+            parts["hour"],
+            parts["minute"],
+            tzinfo=local_tz,
+        )
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     parsed = datetime.fromisoformat(value)
