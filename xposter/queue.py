@@ -132,3 +132,17 @@ def move_with_result(src: Path, dest_dir: Path, result: dict) -> Path:
     with result_path.open("w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     return dest_path
+
+
+def delete_job_files(job_path: Path, img_dir: Path) -> None:
+    """Delete job JSON file and its associated images folder."""
+    job_name = job_path.stem
+    job_img_dir = img_dir / job_name
+
+    # Delete images folder
+    if job_img_dir.is_dir():
+        shutil.rmtree(job_img_dir)
+
+    # Delete job file
+    if job_path.exists():
+        job_path.unlink()

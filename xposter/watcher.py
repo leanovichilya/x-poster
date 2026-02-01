@@ -13,6 +13,7 @@ from .auth import ensure_access_token
 from .log import log_event
 from .models import PostJob
 from .queue import (
+    delete_job_files,
     discover_images,
     init_storage,
     move_with_result,
@@ -142,6 +143,8 @@ def post_job(job: PostJob, job_path: Path, paths: dict[str, Path], base_dir: Pat
         }
         move_with_result(job_path, paths["sent"], result)
         log_event(paths["log"], "job_sent", job_id=job.id, media_count=len(media_ids))
+        # Delete original files after successful send
+        delete_job_files(job_path, paths["img"])
         return True
     except XApiError as exc:
         result = {
