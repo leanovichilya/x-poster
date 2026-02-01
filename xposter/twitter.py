@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import mimetypes
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from .queue import ALLOWED_MEDIA_TYPES
+mimetypes.add_type("image/webp", ".webp")
+
+ALLOWED_MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 
 class XApiError(RuntimeError):
@@ -50,7 +53,7 @@ class XClient:
                 response = client.post(url, headers=self._headers(), files=files, data=data)
         return self._handle_response(response)
 
-    def create_tweet(self, text: str, media_ids: list[str]) -> dict[str, Any]:
+    def create_tweet(self, text: str, media_ids: list[str] | None = None) -> dict[str, Any]:
         url = f"{self.base_url}/2/tweets"
         payload: dict[str, Any] = {}
         if text.strip():

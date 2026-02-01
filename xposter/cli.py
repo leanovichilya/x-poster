@@ -1,217 +1,187 @@
 from __future__ import annotations
 
 import mimetypes
-import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import typer
 
-from .auth import ensure_access_token, login_flow
-from .config import data_paths, load_settings
-from .log import log_event
+from .models import Config, LogEntry
 from .queue import (
-    init_storage,
-    move_with_result,
-    resolve_image_path,
+    get_data_dir,
+    get_due_jobs,
+    init_directories,
+    load_tokens,
+    log_attempt,
+    move_post,
     scan_queue,
-    sort_ready_jobs,
-    validate_job_assets,
 )
 from .twitter import XApiError, XClient
-from .utils import now_utc, resolve_data_dir
-from .watcher import run_watch
+from .watcher import run_watcher
 
-
-app = typer.Typer(help="xposter CLI")
+app = typer.Typer(help="x-poster CLI")
 mimetypes.add_type("image/webp", ".webp")
-auth_app = typer.Typer(help="Authentication commands")
-post_app = typer.Typer(help="Post commands")
-app.add_typer(auth_app, name="auth")
-app.add_typer(post_app, name="post")
 
 
-@app.command()
-def init(
-    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory (default: ./data or XP_DATA_DIR)."),
-) -> None:
-    data_dir = resolve_data_dir(data_dir)
-    init_storage(data_dir)
-    paths = data_paths(data_dir)
-    typer.echo(f"Initialized data directories in {paths['data']}")
+def publish_job(job, tokens: dict, data_dir: Path) -> tuple[bool, str]:
+    access_token = tokens.get("access_token")
+    if not access_token:
+        return False, "No access_token in tokens.json"
 
+    base_url = tokens.get("base_url", "https://api.twitter.com")
+    client = XClient(base_url, access_token)
 
-@auth_app.command("login")
-def auth_login(
-    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory (default: ./data or XP_DATA_DIR)."),
-) -> None:
-    data_dir = resolve_data_dir(data_dir)
-    init_storage(data_dir)
-    settings = load_settings()
-    tokens = login_flow(settings, data_paths(data_dir)["tokens"])
-    typer.echo("Tokens saved.")
-    typer.echo(f"Scopes: {tokens.get('scope', '')}")
-
-
-@post_app.command("next")
-def post_next(
-    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory (default: ./data or XP_DATA_DIR)."),
-    base_dir: Path = typer.Option(
-        None, "--base-dir", help="Base directory for relative image paths (default: current working dir)."
-    ),
-) -> None:
-    data_dir = resolve_data_dir(data_dir)
-    init_storage(data_dir)
-    paths = data_paths(data_dir)
-    base_dir = base_dir or Path.cwd()
-
-    jobs = scan_queue(paths["queue"])
-    for item in jobs:
-        if item.error:
-            result = {
-                "status": "error",
-                "error": {"message": item.error},
-                "ts": now_utc().isoformat(),
-            }
-            move_with_result(item.path, paths["failed"], result)
-            log_event(paths["log"], "job_invalid", level="error", job_file=str(item.path), error=item.error)
-
-    ready_jobs = sort_ready_jobs(jobs)
-    if not ready_jobs:
-        typer.echo("No ready jobs in queue.")
-        return
-
-    job_file = ready_jobs[0]
-    job = job_file.job
-    if job is None:
-        typer.echo("No valid jobs found.")
-        return
-
-    asset_errors = validate_job_assets(job, base_dir)
-    if asset_errors:
-        result = {
-            "status": "error",
-            "error": {"message": "asset validation failed", "details": asset_errors},
-            "ts": now_utc().isoformat(),
-        }
-        move_with_result(job_file.path, paths["failed"], result)
-        log_event(paths["log"], "job_invalid_assets", level="error", job_id=job.id, errors=asset_errors)
-        typer.echo("Job failed asset validation.")
-        return
-
-    settings = load_settings()
-    access_token = ensure_access_token(settings, paths["tokens"])
-    client = XClient(settings.base_url, access_token)
-
-    uploads: list[dict[str, Any]] = []
     media_ids: list[str] = []
     try:
-        for image_path in job.image_paths:
-            resolved = resolve_image_path(image_path, base_dir)
-            media_type, _ = mimetypes.guess_type(resolved.name)
+        for image_path in job.images:
+            media_type, _ = mimetypes.guess_type(image_path.name)
             if not media_type:
-                raise XApiError(f"Unable to determine media type for {resolved.name}")
-            upload_response = client.upload_media(resolved, media_type)
-            uploads.append(upload_response)
+                return False, f"Cannot determine media type for {image_path.name}"
+            response = client.upload_media(image_path, media_type)
             media_id = (
-                upload_response.get("media_id")
-                or upload_response.get("media_id_string")
-                or upload_response.get("data", {}).get("id")
+                response.get("media_id")
+                or response.get("media_id_string")
+                or response.get("data", {}).get("id")
             )
             if not media_id:
-                raise XApiError("Upload response missing media_id", payload=upload_response)
+                return False, f"Upload response missing media_id: {response}"
             media_ids.append(str(media_id))
 
-        tweet_response = client.create_tweet(job.text, media_ids)
-        result = {
-            "status": "success",
-            "job_id": job.id,
-            "uploads": uploads,
-            "tweet": tweet_response,
-            "ts": now_utc().isoformat(),
-        }
-        move_with_result(job_file.path, paths["sent"], result)
-        log_event(paths["log"], "job_sent", job_id=job.id, media_count=len(media_ids))
-        typer.echo("Post created successfully.")
-    except XApiError as exc:
-        result = {
-            "status": "error",
-            "job_id": job.id,
-            "error": {"message": str(exc), "status_code": exc.status_code, "payload": exc.payload},
-            "ts": now_utc().isoformat(),
-        }
-        move_with_result(job_file.path, paths["failed"], result)
-        log_event(
-            paths["log"],
-            "job_failed",
-            level="error",
-            job_id=job.id,
-            status_code=exc.status_code,
-        )
-        typer.echo("Post failed. See result file for details.")
+        client.create_tweet(job.text, media_ids if media_ids else None)
+        return True, ""
+    except XApiError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
 
 
 @app.command()
 def run(
-    interval: int = typer.Option(30, "--interval", help="Seconds between attempts."),
-    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory (default: ./data or XP_DATA_DIR)."),
-    base_dir: Path = typer.Option(
-        None, "--base-dir", help="Base directory for relative image paths (default: current working dir)."
-    ),
+    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory"),
 ) -> None:
-    typer.echo("Starting xposter run loop. Press Ctrl+C to stop.")
-    while True:
-        try:
-            post_next(data_dir=data_dir, base_dir=base_dir)
-        except Exception as exc:
-            typer.echo(f"Error: {exc}")
-        time.sleep(interval)
+    data_dir = data_dir or get_data_dir()
+    init_directories(data_dir)
+    config = Config.load(data_dir / "config.json")
+    tokens = load_tokens(data_dir)
+
+    jobs, errors = scan_queue(data_dir, config)
+
+    for path, err in errors:
+        typer.echo(f"Error in {path}: {err}")
+
+    due_jobs = get_due_jobs(jobs)
+
+    if not due_jobs:
+        typer.echo("No due posts to process.")
+        return
+
+    for job in due_jobs:
+        typer.echo(f"Processing: {job.folder}")
+        now = datetime.now()
+
+        success, error_msg = publish_job(job, tokens, data_dir)
+
+        if success:
+            dest = move_post(job, data_dir, "sent")
+            status = "sent"
+            typer.echo(f"  Sent -> {dest}")
+        else:
+            dest = move_post(job, data_dir, "failed", error_msg)
+            status = "failed"
+            typer.echo(f"  Failed -> {dest}")
+            typer.echo(f"  Error: {error_msg}")
+
+        entry = LogEntry(
+            timestamp=now.isoformat(),
+            status=status,
+            slot=job.slot,
+            scheduled_datetime=job.scheduled_dt.isoformat(),
+            actual_send_time=now.strftime("%H:%M"),
+            source_path=str(job.folder),
+            destination_path=str(dest),
+            labels=job.labels,
+            error=error_msg,
+        )
+        log_attempt(data_dir, entry)
+
+
+@app.command("dry-run")
+def dry_run(
+    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory"),
+) -> None:
+    data_dir = data_dir or get_data_dir()
+    init_directories(data_dir)
+    config = Config.load(data_dir / "config.json")
+
+    jobs, errors = scan_queue(data_dir, config)
+
+    for path, err in errors:
+        typer.echo(f"Error in {path}: {err}")
+
+    due_jobs = get_due_jobs(jobs)
+
+    if not due_jobs:
+        typer.echo("No due posts to process.")
+        return
+
+    typer.echo(f"Would process {len(due_jobs)} post(s):\n")
+    now = datetime.now()
+    time_str = now.strftime("%H-%M")
+
+    for job in due_jobs:
+        dest_sent = data_dir / "sent" / job.slot / job.date_str / time_str / job.folder.name
+        dest_failed = data_dir / "failed" / job.slot / job.date_str / time_str / job.folder.name
+        typer.echo(f"Post: {job.folder}")
+        typer.echo(f"  Text: {job.text[:50]}{'...' if len(job.text) > 50 else ''}")
+        typer.echo(f"  Slot: {job.slot}")
+        typer.echo(f"  Scheduled: {job.scheduled_dt}")
+        typer.echo(f"  Images: {len(job.images)}")
+        typer.echo(f"  On success -> {dest_sent}")
+        typer.echo(f"  On failure -> {dest_failed}")
+        typer.echo()
 
 
 @app.command()
 def validate(
-    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory (default: ./data or XP_DATA_DIR)."),
-    base_dir: Path = typer.Option(
-        None, "--base-dir", help="Base directory for relative image paths (default: current working dir)."
-    ),
+    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory"),
 ) -> None:
-    data_dir = resolve_data_dir(data_dir)
-    init_storage(data_dir)
-    paths = data_paths(data_dir)
-    base_dir = base_dir or Path.cwd()
+    data_dir = data_dir or get_data_dir()
+    init_directories(data_dir)
+    config = Config.load(data_dir / "config.json")
 
-    errors: list[str] = []
-    jobs = scan_queue(paths["queue"])
-    for item in jobs:
-        if item.error:
-            errors.append(f"{item.path.name}: {item.error}")
-            continue
-        job = item.job
-        if job is None:
-            continue
-        asset_errors = validate_job_assets(job, base_dir)
-        for asset_error in asset_errors:
-            errors.append(f"{item.path.name}: {asset_error}")
+    jobs, errors = scan_queue(data_dir, config)
 
     if errors:
-        typer.echo("Validation failed:")
-        for err in errors:
-            typer.echo(f"- {err}")
+        typer.echo("Validation errors:")
+        for path, err in errors:
+            typer.echo(f"  {path}: {err}")
         raise typer.Exit(code=1)
-    typer.echo("Validation OK.")
+
+    typer.echo(f"Validation OK. Found {len(jobs)} valid post(s).")
+    for job in jobs:
+        typer.echo(f"  {job.folder.name} ({job.slot}, {job.scheduled_dt})")
+
+
+@app.command()
+def init(
+    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory"),
+) -> None:
+    data_dir = data_dir or get_data_dir()
+    init_directories(data_dir)
+    typer.echo(f"Initialized data directories in {data_dir}")
+
+
+def _publish_job_for_watcher(job, tokens: dict) -> tuple[bool, str]:
+    return publish_job(job, tokens, None)
 
 
 @app.command()
 def watch(
-    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory (default: ./data or XP_DATA_DIR)."),
-    base_dir: Path = typer.Option(
-        None, "--base-dir", help="Base directory for relative image paths (default: current working dir)."
-    ),
+    data_dir: Path = typer.Option(None, "--data-dir", help="Data directory"),
+    interval: int = typer.Option(30, "--interval", help="Check interval in seconds"),
 ) -> None:
-    """Watch queue for new jobs and process scheduled posts."""
-    data_dir = resolve_data_dir(data_dir)
-    base_dir = base_dir or Path.cwd()
-    run_watch(data_dir, base_dir)
+    data_dir = data_dir or get_data_dir()
+    run_watcher(data_dir, _publish_job_for_watcher, interval)
 
 
 if __name__ == "__main__":

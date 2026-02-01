@@ -1,51 +1,80 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
-
-from pydantic import BaseModel, Field, field_validator
-
-from .utils import parse_iso_datetime
-
 
 MAX_TWEET_LENGTH = 280
-MIN_IMAGES = 1
 MAX_IMAGES = 4
+VALID_SLOTS = {"morning", "day", "night"}
 
 
-class PostJob(BaseModel):
-    id: str
-    publish_at: datetime | None = None
-    text: str = ""
-    image_paths: list[Path] = Field(default_factory=list)
-    labels: list[str] = Field(default_factory=list)
+@dataclass
+class PostJob:
+    folder: Path
+    text: str
+    publish_at: str
+    labels: list[str]
+    images: list[Path]
+    date_str: str
+    slot: str
+    scheduled_dt: datetime
 
-    @field_validator("publish_at", mode="before")
+    def validate(self) -> list[str]:
+        errors = []
+        if len(self.text) > MAX_TWEET_LENGTH:
+            errors.append(f"text exceeds {MAX_TWEET_LENGTH} characters")
+        if not self.labels:
+            errors.append("labels array is empty, first label must be slot (morning/day/night)")
+        elif self.labels[0] not in VALID_SLOTS:
+            errors.append(f"first label must be one of {VALID_SLOTS}, got '{self.labels[0]}'")
+        if len(self.images) > MAX_IMAGES:
+            errors.append(f"more than {MAX_IMAGES} images found")
+        return errors
+
+
+@dataclass
+class Config:
+    timezone: str
+    default_times: dict[str, str]
+
     @classmethod
-    def _parse_publish_at(cls, value: Any) -> Any:
-        if value is None or isinstance(value, datetime):
-            return value
-        if isinstance(value, str):
-            return parse_iso_datetime(value)
-        return value
+    def load(cls, path: Path) -> Config:
+        import json
+        if not path.exists():
+            return cls(timezone="local", default_times={"morning": "09:00", "day": "13:00", "night": "22:30"})
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return cls(
+            timezone=data.get("timezone", "local"),
+            default_times=data.get("default_times", {"morning": "09:00", "day": "13:00", "night": "22:30"})
+        )
 
-    @field_validator("text")
-    @classmethod
-    def _validate_text(cls, value: str) -> str:
-        if len(value) > MAX_TWEET_LENGTH:
-            raise ValueError(f"text length exceeds {MAX_TWEET_LENGTH} characters")
-        return value
+    def get_time_for_slot(self, slot: str) -> str:
+        return self.default_times.get(slot, "12:00")
 
-    @field_validator("image_paths")
-    @classmethod
-    def _validate_images(cls, value: list[Path]) -> list[Path]:
-        count = len(value)
-        if count > MAX_IMAGES:
-            raise ValueError(f"image_paths must contain at most {MAX_IMAGES} items")
-        return value
 
-    def validate_image_count(self) -> None:
-        count = len(self.image_paths)
-        if count < MIN_IMAGES or count > MAX_IMAGES:
-            raise ValueError(f"image_paths must contain {MIN_IMAGES}-{MAX_IMAGES} items, got {count}")
+@dataclass
+class LogEntry:
+    timestamp: str
+    status: str
+    slot: str
+    scheduled_datetime: str
+    actual_send_time: str
+    source_path: str
+    destination_path: str
+    labels: list[str]
+    error: str
+
+    def to_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp,
+            "status": self.status,
+            "slot": self.slot,
+            "scheduled_datetime": self.scheduled_datetime,
+            "actual_send_time": self.actual_send_time,
+            "source_path": self.source_path,
+            "destination_path": self.destination_path,
+            "labels": self.labels,
+            "error": self.error
+        }

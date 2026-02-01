@@ -1,183 +1,164 @@
 # x-poster
 
-A CLI utility for posting queued text and images to X (Twitter) using API v2.
-
-## Features
-
-- **Queue-based posting** - Create JSON job files and let x-poster handle the rest
-- **OAuth2 PKCE authentication** - Secure login flow with automatic token refresh
-- **Media upload** - Attach 1-4 images per post (supports JPEG, PNG, GIF, WebP)
-- **Scheduled posts** - Set `publish_at` to delay posting until a specific time
-- **File watcher** - Automatically process new jobs as they appear in the queue
-- **Auto-discover images** - Images placed in `queue/img/` are auto-detected
+CLI tool for publishing posts from a local folder queue to X (Twitter).
 
 ## Installation
 
-Requires Python 3.10+.
-
 ```bash
-# Clone the repository
-git clone <repo-url>
-cd x-poster
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install in development mode
 pip install -e .
 ```
 
-## Configuration
-
-1. Copy `.env.example` to `.env`:
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Fill in your X API credentials:
-   ```env
-   X_CLIENT_ID=your_client_id
-   X_CLIENT_SECRET=your_client_secret  # Optional for public PKCE clients
-   X_REDIRECT_URI=http://127.0.0.1:8080/callback
-   X_SCOPES=tweet.read tweet.write users.read media.write offline.access
-   ```
-
-3. Initialize the data directories:
-   ```bash
-   xposter init
-   ```
-
-## Usage
-
-### Authentication
-
-Login to X and save access tokens:
+Or:
 
 ```bash
-xposter auth login
+pip install -r requirements.txt
 ```
 
-This opens the OAuth2 authorization flow. Follow the prompts to authorize the app.
+## Setup
 
-### Creating a Post Job
+Initialize data directories:
 
-Create a JSON file in the `data/queue/` directory:
+```bash
+xposter init
+```
+
+This creates:
+
+```
+data/
+├── queue/
+├── sent/
+│   ├── morning/
+│   ├── day/
+│   └── night/
+├── failed/
+│   ├── morning/
+│   ├── day/
+│   └── night/
+├── config.json
+├── tokens.json
+├── schedule.json
+└── log.jsonl
+```
+
+Edit `data/tokens.json` with your credentials:
 
 ```json
 {
-  "id": "unique-job-id",
-  "text": "Hello from x-poster!",
-  "publish_at": "2025-01-28T12:00:00Z",
-  "labels": ["greeting"]
+  "access_token": "your_access_token",
+  "base_url": "https://api.twitter.com"
 }
 ```
 
-**Job fields:**
+## Creating Posts
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | string | Yes | Unique identifier for the job |
-| `text` | string | No | Tweet text (max 280 characters) |
-| `publish_at` | string | No | ISO 8601 datetime; if set, post is delayed until this time |
-| `labels` | array | No | Tags for organization |
-
-### Images
-
-Images are auto-discovered from a folder matching the job `id`. Place images in `data/queue/img/<job-id>/`:
+Create a post folder in `data/queue/yyyy-mm-dd/any_name/`:
 
 ```
-data/queue/img/unique-job-id/
-├── image1.jpg
-├── image2.png
-└── image3.webp
+data/queue/2025-02-01/hello-world/
+├── post.json
+├── 01.png
+└── 02.jpg
 ```
 
-If no matching folder exists, the post will be published without images.
+`post.json` schema:
 
-### Posting
-
-**Post the next ready job:**
-
-```bash
-xposter post next
+```json
+{
+  "text": "Hello from x-poster!",
+  "publish_at": "",
+  "labels": ["morning", "greeting"]
+}
 ```
 
-**Run continuously (polls every N seconds):**
+- `labels[0]` must be `morning`, `day`, or `night` (the slot)
+- `publish_at` is optional; if empty, uses default time from `config.json`
+- Images must be named `01.png`, `02.png`, `03.png`, `04.png` (up to 4)
 
-```bash
-xposter run --interval 30
+## Configuration
+
+`data/config.json`:
+
+```json
+{
+  "timezone": "local",
+  "default_times": {
+    "morning": "09:00",
+    "day": "13:00",
+    "night": "22:30"
+  }
+}
 ```
 
-**Watch for new jobs and scheduled posts:**
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `xposter init` | Initialize data directories |
+| `xposter watch` | Watch queue and post on schedule |
+| `xposter run` | Process all due posts once |
+| `xposter dry-run` | Preview what would be posted |
+| `xposter validate` | Validate queue structure |
+
+### Options
+
+- `--data-dir PATH` - Override data directory (default: `./data` or `XP_DATA_DIR`)
+
+## Watch Mode
 
 ```bash
 xposter watch
 ```
 
-The watch command monitors the queue directory for changes and processes scheduled posts automatically.
+The main way to run x-poster. Starts a background process that:
 
-### Validation
+1. Scans `queue/` and builds schedule on startup
+2. Sets timer for next scheduled post (no polling)
+3. Watches for file changes in `queue/`
+4. After file changes, waits 30 seconds (debounce) then rescans
+5. Saves schedule to `data/schedule.json` on changes and exit
 
-Check all queue jobs for errors without posting:
-
-```bash
-xposter validate
-```
-
-## Commands Reference
-
-| Command | Description |
-|---------|-------------|
-| `xposter init` | Initialize data directories |
-| `xposter auth login` | Authenticate with X |
-| `xposter post next` | Post the next ready job from the queue |
-| `xposter run` | Continuously poll and post ready jobs |
-| `xposter validate` | Validate all jobs in the queue |
-| `xposter watch` | Watch queue and process jobs automatically |
-
-### Common Options
-
-- `--data-dir PATH` - Override default data directory (default: `./data` or `XP_DATA_DIR`)
-- `--base-dir PATH` - Base directory for resolving relative image paths (default: current working dir)
-
-## Directory Structure
+Example output:
 
 ```
-data/
-├── queue/          # Pending job files (.json)
-│   └── img/        # Auto-discovered images
-├── sent/           # Successfully posted jobs (with .result.json)
-├── failed/         # Failed jobs (with .result.json)
-├── tokens.json     # OAuth2 tokens (auto-managed)
-└── log.jsonl       # Append-only event log
+[watcher] Initial scan...
+[watcher] Found 2 post(s)
+  hello-world @ 2025-02-01 09:00:00
+  goodbye @ 2025-02-01 22:30:00
+[scheduler] Next post: hello-world at 2025-02-01 09:00:00 (in 3600s)
+[watcher] Watching data\queue
+
+[watcher] added: post.json
+[watcher] Changes detected, waiting 30s...
+[watcher] Rescanning queue...
 ```
 
-## Example Workflow
+Press `Ctrl+C` to stop. Schedule is saved automatically.
 
-1. Authenticate:
-   ```bash
-   xposter auth login
-   ```
+## Output
 
-2. Create a job file `data/queue/my-post.json`:
-   ```json
-   {
-     "id": "my-first-post",
-     "text": "Testing x-poster!"
-   }
-   ```
+After processing:
 
-   Optionally, add images in `data/queue/img/my-first-post/`.
+- **Success**: Post moved to `data/sent/{slot}/yyyy-mm-dd/HH-MM/post_name/`
+- **Failure**: Post moved to `data/failed/{slot}/yyyy-mm-dd/HH-MM/post_name/` with `error.txt`
 
-3. Validate and post:
-   ```bash
-   xposter validate
-   xposter post next
-   ```
+All attempts are logged to `data/log.jsonl`.
 
-4. Check results in `data/sent/` or `data/failed/`.
+## Schedule File
 
-## License
+`data/schedule.json` stores the current queue state:
 
-MIT
+```json
+[
+  {
+    "folder": "data/queue/2025-02-01/hello-world",
+    "text": "Hello!",
+    "slot": "morning",
+    "scheduled_dt": "2025-02-01T09:00:00",
+    "labels": ["morning", "greeting"],
+    "images": ["data/queue/2025-02-01/hello-world/01.png"]
+  }
+]
+```
+
+This file is updated automatically and preserves the queue on restart.

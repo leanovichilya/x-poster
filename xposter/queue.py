@@ -1,148 +1,170 @@
 from __future__ import annotations
 
 import json
-import mimetypes
+import re
 import shutil
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
 
-from .config import data_paths
-from .models import PostJob
-from .utils import FileCheck, now_utc, read_json, write_json
+from .models import Config, LogEntry, PostJob, VALID_SLOTS
 
-
-mimetypes.add_type("image/webp", ".webp")
-
-ALLOWED_MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp"}
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_PATTERN = re.compile(r"^0[1-4]\.(png|jpg|jpeg|webp)$", re.IGNORECASE)
+DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def discover_images(job_file: Path, img_dir: Path) -> list[Path]:
-    """Find images in img/{job_name}/ folder for a job file."""
-    job_name = job_file.stem
-    job_img_dir = img_dir / job_name
-    if not job_img_dir.is_dir():
-        return []
-    images = [
-        p for p in sorted(job_img_dir.iterdir())
-        if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
-    ]
+def get_data_dir() -> Path:
+    import os
+    return Path(os.getenv("XP_DATA_DIR", "./data"))
+
+
+def init_directories(data_dir: Path) -> None:
+    (data_dir / "queue").mkdir(parents=True, exist_ok=True)
+    for slot in VALID_SLOTS:
+        (data_dir / "sent" / slot).mkdir(parents=True, exist_ok=True)
+        (data_dir / "failed" / slot).mkdir(parents=True, exist_ok=True)
+    if not (data_dir / "log.jsonl").exists():
+        (data_dir / "log.jsonl").touch()
+    if not (data_dir / "tokens.json").exists():
+        (data_dir / "tokens.json").write_text("{}", encoding="utf-8")
+    if not (data_dir / "config.json").exists():
+        default_config = {
+            "timezone": "local",
+            "default_times": {"morning": "09:00", "day": "13:00", "night": "22:30"}
+        }
+        (data_dir / "config.json").write_text(json.dumps(default_config, indent=2), encoding="utf-8")
+
+
+def discover_images(folder: Path) -> list[Path]:
+    images = []
+    for f in sorted(folder.iterdir()):
+        if f.is_file() and IMAGE_PATTERN.match(f.name):
+            images.append(f)
     return images
 
 
-@dataclass(frozen=True)
-class JobFile:
-    path: Path
-    job: PostJob | None
-    error: str | None
+def parse_scheduled_datetime(date_str: str, time_str: str) -> datetime:
+    dt_str = f"{date_str} {time_str}"
+    return datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
 
 
-def init_storage(data_dir: Path) -> None:
-    paths = data_paths(data_dir)
-    for key in ("queue", "img", "sent", "failed"):
-        paths[key].mkdir(parents=True, exist_ok=True)
-    if not paths["tokens"].exists():
-        write_json(paths["tokens"], {})
-    if not paths["log"].exists():
-        paths["log"].touch()
+def scan_queue(data_dir: Path, config: Config) -> tuple[list[PostJob], list[tuple[Path, str]]]:
+    queue_dir = data_dir / "queue"
+    jobs = []
+    errors = []
 
-
-def list_queue_files(queue_dir: Path) -> list[Path]:
     if not queue_dir.exists():
-        return []
-    files = sorted(queue_dir.glob("*.json"))
-    return [path for path in files if not path.name.endswith(".result.json")]
+        return jobs, errors
+
+    for date_folder in sorted(queue_dir.iterdir()):
+        if not date_folder.is_dir():
+            continue
+        if not DATE_PATTERN.match(date_folder.name):
+            errors.append((date_folder, f"invalid date folder name: {date_folder.name}"))
+            continue
+
+        date_str = date_folder.name
+
+        for post_folder in sorted(date_folder.iterdir()):
+            if not post_folder.is_dir():
+                continue
+
+            post_json = post_folder / "post.json"
+            if not post_json.exists():
+                errors.append((post_folder, "missing post.json"))
+                continue
+
+            try:
+                with post_json.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError as e:
+                errors.append((post_folder, f"invalid JSON: {e}"))
+                continue
+
+            text = data.get("text", "")
+            publish_at = data.get("publish_at", "")
+            labels = data.get("labels", [])
+
+            if not labels:
+                errors.append((post_folder, "labels array is empty"))
+                continue
+
+            slot = labels[0]
+            if slot not in VALID_SLOTS:
+                errors.append((post_folder, f"first label must be slot (morning/day/night), got '{slot}'"))
+                continue
+
+            time_str = publish_at if publish_at else config.get_time_for_slot(slot)
+
+            try:
+                scheduled_dt = parse_scheduled_datetime(date_str, time_str)
+            except ValueError as e:
+                errors.append((post_folder, f"invalid time format: {e}"))
+                continue
+
+            images = discover_images(post_folder)
+
+            job = PostJob(
+                folder=post_folder,
+                text=text,
+                publish_at=publish_at,
+                labels=labels,
+                images=images,
+                date_str=date_str,
+                slot=slot,
+                scheduled_dt=scheduled_dt
+            )
+
+            validation_errors = job.validate()
+            if validation_errors:
+                for err in validation_errors:
+                    errors.append((post_folder, err))
+                continue
+
+            jobs.append(job)
+
+    return jobs, errors
 
 
-def scan_queue(queue_dir: Path) -> list[JobFile]:
-    jobs: list[JobFile] = []
-    img_dir = queue_dir / "img"
-    for path in list_queue_files(queue_dir):
-        try:
-            payload = read_json(path)
-            job = PostJob.model_validate(payload)
-            # Auto-discover images if none specified
-            if not job.image_paths:
-                discovered = discover_images(path, img_dir)
-                job = job.model_copy(update={"image_paths": discovered})
-            job.validate_image_count()
-            jobs.append(JobFile(path=path, job=job, error=None))
-        except Exception as exc:  # noqa: BLE001 - we want to capture parsing errors
-            jobs.append(JobFile(path=path, job=None, error=str(exc)))
-    return jobs
+def get_due_jobs(jobs: list[PostJob], now: datetime | None = None) -> list[PostJob]:
+    now = now or datetime.now()
+    return [j for j in jobs if j.scheduled_dt <= now]
 
 
-def is_ready(job: PostJob, now: datetime | None = None) -> bool:
-    now = now or now_utc()
-    if job.publish_at is None:
-        return True
-    return job.publish_at <= now
+def move_post(job: PostJob, data_dir: Path, status: str, error_msg: str = "") -> Path:
+    now = datetime.now()
+    time_str = now.strftime("%H-%M")
+
+    if status == "sent":
+        base = data_dir / "sent"
+    else:
+        base = data_dir / "failed"
+
+    dest = base / job.slot / job.date_str / time_str / job.folder.name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    shutil.move(str(job.folder), str(dest))
+
+    if status == "failed" and error_msg:
+        error_file = dest / "error.txt"
+        error_file.write_text(error_msg, encoding="utf-8")
+
+    date_folder = job.folder.parent
+    if date_folder.exists() and not any(date_folder.iterdir()):
+        date_folder.rmdir()
+
+    return dest
 
 
-def resolve_image_path(path: Path, base_dir: Path) -> Path:
-    if path.is_absolute():
-        return path
-    return (base_dir / path).resolve()
+def log_attempt(data_dir: Path, entry: LogEntry) -> None:
+    log_file = data_dir / "log.jsonl"
+    with log_file.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
 
 
-def check_image_file(path: Path) -> FileCheck:
-    if not path.exists():
-        return FileCheck(path=path, ok=False, error="file not found")
-    if not path.is_file():
-        return FileCheck(path=path, ok=False, error="not a file")
-    size = path.stat().st_size
-    if size > MAX_IMAGE_BYTES:
-        return FileCheck(path=path, ok=False, error=f"file size {size} exceeds {MAX_IMAGE_BYTES} bytes")
-    media_type, _ = mimetypes.guess_type(path.name)
-    if media_type not in ALLOWED_MEDIA_TYPES:
-        return FileCheck(path=path, ok=False, error=f"unsupported media type {media_type}")
-    return FileCheck(path=path, ok=True)
-
-
-def validate_job_assets(job: PostJob, base_dir: Path) -> list[str]:
-    errors: list[str] = []
-    for image_path in job.image_paths:
-        resolved = resolve_image_path(image_path, base_dir)
-        check = check_image_file(resolved)
-        if not check.ok:
-            errors.append(f"{image_path}: {check.error}")
-    return errors
-
-
-def sort_ready_jobs(jobs: Iterable[JobFile]) -> list[JobFile]:
-    now = now_utc()
-    ready: list[JobFile] = []
-    for item in jobs:
-        if item.job and is_ready(item.job):
-            ready.append(item)
-    def sort_key(item: JobFile) -> tuple[datetime, str]:
-        publish_at = item.job.publish_at or now
-        return (publish_at, item.path.name)
-    return sorted(ready, key=sort_key)
-
-
-def move_with_result(src: Path, dest_dir: Path, result: dict) -> Path:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = dest_dir / src.name
-    shutil.move(str(src), str(dest_path))
-    result_path = dest_path.with_suffix(".result.json")
-    with result_path.open("w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    return dest_path
-
-
-def delete_job_files(job_path: Path, img_dir: Path) -> None:
-    """Delete job JSON file and its associated images folder."""
-    job_name = job_path.stem
-    job_img_dir = img_dir / job_name
-
-    # Delete images folder
-    if job_img_dir.is_dir():
-        shutil.rmtree(job_img_dir)
-
-    # Delete job file
-    if job_path.exists():
-        job_path.unlink()
+def load_tokens(data_dir: Path) -> dict:
+    tokens_file = data_dir / "tokens.json"
+    if not tokens_file.exists():
+        return {}
+    with tokens_file.open("r", encoding="utf-8") as f:
+        return json.load(f)
